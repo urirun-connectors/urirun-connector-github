@@ -1,0 +1,20 @@
+{
+  "id": "github",
+  "name": "GitHub",
+  "status": "available",
+  "category": "DevOps",
+  "summary": "Clone git repos and deploy them anywhere via bindings/registry over github:// URI routes.",
+  "description": "GitHub is an external urirun connector that bootstraps projects onto any machine over the URI contract: clone a repo, pull updates, pip install it, and emit its urirun_bindings() so the project can be compiled into a registry and served or host-deployed without logging into the box. Clones land under URIRUN_PROJECTS (default ~/.urirun-projects).",
+  "useCases": [
+    "Bootstrap a connector/pack onto a remote node: clone -> bindings -> host deploy.",
+    "Quick project rollout on any computer from a git URL, driven by URIs.",
+    "Keep a node's cloned repos up to date (git pull) over the mesh."
+  ],
+  "flowExample": ["github://host/repo/command/clone", "github://host/repo/query/bindings", "github://host/package/command/install"],
+  "requires": ["python>=3.10", "git"],
+  "install": {"mode": "urirun-extra", "pipSpec": "urirun-connector-github @ git+https://github.com/if-uri/urirun-connector-github.git@v0.1.0"},
+  "provenance": "community",
+  "publisher": {"name": "if-uri", "url": "https://ifuri.com", "github": "https://github.com/if-uri"},
+  "docsUrl": "https://github.com/if-uri/urirun-connector-github",
+  "keywords": ["git", "github", "clone", "deploy", "bootstrap", "registry", "connector"]
+}
