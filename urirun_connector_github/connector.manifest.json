@@ -17,11 +17,13 @@
   ],
   "requires": [
     "python>=3.10",
-    "git"
+    "git",
+    "gh for authenticated GitHub operations",
+    "credential vault for token import"
   ],
   "install": {
     "mode": "urirun-extra",
-    "pipSpec": "urirun-connector-github @ git+https://github.com/if-uri/urirun-connector-github.git@v0.1.0"
+    "pipSpec": "urirun-connector-github @ git+https://github.com/urirun-connectors/urirun-connector-github.git@v0.1.0"
   },
   "provenance": "verified",
   "publisher": {
@@ -29,7 +31,7 @@
     "url": "https://ifuri.com",
     "github": "https://github.com/if-uri"
   },
-  "docsUrl": "https://github.com/if-uri/urirun-connector-github",
+  "docsUrl": "https://github.com/urirun-connectors/urirun-connector-github",
   "keywords": [
     "git",
     "github",
@@ -43,8 +45,12 @@
     "github"
   ],
   "routes": [
+    "github://host/auth/command/import-to-vault",
+    "github://host/auth/query/status",
+    "github://host/doctor/query/report",
     "github://host/package/command/install",
     "github://host/repo/command/clone",
+    "github://host/repo/command/create",
     "github://host/repo/command/pull",
     "github://host/repo/query/bindings",
     "github://host/repo/query/list"
@@ -54,7 +60,7 @@
       "title": "Clone a repo",
       "uri": "github://host/repo/command/clone",
       "payload": {
-        "repo": "if-uri/urirun",
+        "url": "https://github.com/if-uri/urirun.git",
         "dest": "/srv/urirun"
       }
     },
@@ -62,7 +68,8 @@
       "title": "Read bindings",
       "uri": "github://host/repo/query/bindings",
       "payload": {
-        "repo": "if-uri/urirun-connector-llm"
+        "dest": "/srv/urirun-connector-llm",
+        "module": "urirun_connector_llm"
       }
     }
   ],

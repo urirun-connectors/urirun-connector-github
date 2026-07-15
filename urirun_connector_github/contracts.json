@@ -1,5 +1,41 @@
 {
   "contracts": {
+    "auth/query/status": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": { "hostname": "?str" },
+      "out": { "hostname": "str", "authenticated": "bool" },
+      "errors": ["degraded-backend"],
+      "examples": [{ "payload": {}, "result": { "ok": true, "hostname": "github.com", "authenticated": true } }]
+    },
+    "auth/command/import-to-vault": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": { "hostname": "?str", "api_url": "?str", "vault_url": "?str", "vault_entry_id": "?str" },
+      "out": { "hostname": "str", "login": "str", "scopes": "list", "vault_entry_id": "str", "token_stored": "bool" },
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{ "payload": {}, "result": { "ok": true, "hostname": "github.com", "login": "founder", "scopes": ["repo"], "vault_entry_id": "github-cli-runtime", "token_stored": true } }]
+    },
+    "repo/command/create": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": { "name": "str", "owner": "?str", "visibility": "?str", "description": "?str", "source": "?str", "push": "?bool", "hostname": "?str" },
+      "out": { "repository": "str", "url": "str", "created": "bool" },
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{ "payload": { "name": "demo", "owner": "example" }, "result": { "ok": true, "repository": "example/demo", "url": "https://github.com/example/demo", "created": true } }]
+    },
+    "doctor/query/report": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {},
+      "out": { "connector": "str", "version": "str", "status": "str" },
+      "errors": [],
+      "examples": [{ "payload": {}, "result": { "ok": true, "connector": "github", "version": "0.1.0", "status": "ready" } }]
+    },
     "repo/command/clone": {
       "version": "v1",
       "effect": "command",

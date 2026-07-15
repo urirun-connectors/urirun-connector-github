@@ -26,4 +26,4 @@ where = ["."]
 include = ["urirun_connector_github*"]
 
 [tool.setuptools.package-data]
-urirun_connector_github = ["connector.manifest.json"]
+urirun_connector_github = ["connector.manifest.json", "contracts.json"]

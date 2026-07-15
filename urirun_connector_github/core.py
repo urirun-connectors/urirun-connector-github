@@ -24,8 +24,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +52,81 @@ def _name(url: str) -> str:
 
 def _git(args: list[str], timeout: float = 300.0) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def _lease_github_token() -> str:
+    vault_url = os.environ.get("URIRUN_VAULT_URL", "").rstrip("/")
+    vault_token = os.environ.get("URIRUN_VAULT_TOKEN", "")
+    entry_id = os.environ.get("GITHUB_VAULT_ENTRY_ID", "github-cli-runtime")
+    if not vault_url or not vault_token:
+        return ""
+    body = json.dumps({"origin": "https://github.com", "field": "api_key"}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{vault_url}/internal/vault/{urllib.parse.quote(entry_id, safe='')}/lease",
+        data=body,
+        method="POST",
+        headers={"authorization": f"Bearer {vault_token}", "content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as error:
+        raise RuntimeError("github_vault_lease_failed") from error
+    token = str(data.get("secret") or "")
+    if not token:
+        raise RuntimeError("github_vault_lease_failed")
+    return token
+
+
+def _gh(args: list[str], timeout: float = 120.0, *, use_vault: bool = True) -> subprocess.CompletedProcess:
+    token = ""
+    try:
+        token = _lease_github_token() if use_vault and not os.environ.get("GH_TOKEN") else ""
+        env = dict(os.environ)
+        if token:
+            env["GH_TOKEN"] = token
+        return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout, env=env)
+    except RuntimeError:
+        return subprocess.CompletedProcess(["gh", *args], 1, "", "github_vault_lease_failed")
+    finally:
+        token = ""
+
+
+def _github_identity(token: str, api_url: str = "https://api.github.com") -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{api_url.rstrip('/')}/user",
+        headers={"authorization": f"Bearer {token}", "accept": "application/vnd.github+json", "user-agent": "urirun-connector-github"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            scopes = [item.strip() for item in response.headers.get("x-oauth-scopes", "").split(",") if item.strip()]
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as error:
+        raise RuntimeError("github_token_validation_failed") from error
+    return {"login": str(data.get("login") or ""), "scopes": scopes}
+
+
+def _store_token_in_vault(*, vault_url: str, vault_token: str, entry_id: str, origin: str, token: str) -> str:
+    if not vault_url or not vault_token:
+        raise RuntimeError("github_vault_not_configured")
+    body = json.dumps({
+        "id": entry_id,
+        "origin": origin,
+        "label": "GitHub CLI token",
+        "secrets": {"api_key": token},
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{vault_url.rstrip('/')}/vault",
+        data=body,
+        method="POST",
+        headers={"authorization": f"Bearer {vault_token}", "content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as error:
+        raise RuntimeError("github_vault_store_failed") from error
+    return str(data.get("entry", {}).get("id") or entry_id)
 
 
 @conn.handler("repo/command/clone", isolated=True, meta={"label": "git clone a repository"})
@@ -126,6 +205,76 @@ def repo_bindings(dest: str = "", module: str = "") -> dict[str, Any]:
     if found:
         return urirun.ok(source=str(found[0]), **json.loads(found[0].read_text(encoding="utf-8")))
     return urirun.fail("no `module` given and no *.bindings.json found in the repo")
+
+
+@conn.handler("auth/query/status", isolated=True, meta={"label": "Check GitHub CLI authentication"})
+def auth_status(hostname: str = "github.com") -> dict[str, Any]:
+    proc = _gh(["auth", "status", "--hostname", hostname], timeout=30)
+    return urirun.ok(hostname=hostname, authenticated=proc.returncode == 0)
+
+
+@conn.handler("auth/command/import-to-vault", isolated=True, meta={"label": "Validate gh token and store it in vault"})
+def import_gh_token_to_vault(
+    hostname: str = "github.com",
+    api_url: str = "https://api.github.com",
+    vault_url: str = "",
+    vault_entry_id: str = "github-cli-runtime",
+) -> dict[str, Any]:
+    """Move the active gh token into the vault without returning or logging it."""
+    proc = _gh(["auth", "token", "--hostname", hostname], timeout=30, use_vault=False)
+    token = proc.stdout.strip() if proc.returncode == 0 else ""
+    if not token:
+        return urirun.fail("github_cli_token_unavailable")
+    try:
+        identity = _github_identity(token, api_url)
+        stored_id = _store_token_in_vault(
+            vault_url=vault_url or os.environ.get("URIRUN_VAULT_URL", ""),
+            vault_token=os.environ.get("URIRUN_VAULT_TOKEN", ""),
+            entry_id=vault_entry_id,
+            origin=f"https://{hostname}",
+            token=token,
+        )
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    finally:
+        token = ""
+    return urirun.ok(
+        hostname=hostname,
+        login=identity["login"],
+        scopes=identity["scopes"],
+        vault_entry_id=stored_id,
+        token_stored=True,
+    )
+
+
+@conn.handler("repo/command/create", isolated=True, meta={"label": "Create a GitHub repository with gh"})
+def create_repo(
+    name: str = "",
+    owner: str = "",
+    visibility: str = "private",
+    description: str = "",
+    source: str = "",
+    push: bool = False,
+    hostname: str = "github.com",
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        return urirun.fail("invalid_repository_name")
+    if owner and not re.fullmatch(r"[A-Za-z0-9_.-]+", owner):
+        return urirun.fail("invalid_repository_owner")
+    if visibility not in {"private", "public", "internal"}:
+        return urirun.fail("invalid_repository_visibility")
+    repository = f"{owner}/{name}" if owner else name
+    args = ["repo", "create", repository, f"--{visibility}"]
+    if description:
+        args += ["--description", description[:350]]
+    if source:
+        args += ["--source", source, "--remote", "origin"]
+        if push:
+            args.append("--push")
+    proc = _gh(args, timeout=180)
+    if proc.returncode != 0:
+        return urirun.fail("github_repository_create_failed", repository=repository)
+    return urirun.ok(repository=repository, url=f"https://{hostname}/{repository}", created=True)
 
 
 # --- authoring surface -----------------------------------------------------
