@@ -5,9 +5,9 @@
       "effect": "query",
       "reversible": false,
       "inp": { "hostname": "?str" },
-      "out": { "hostname": "str", "authenticated": "bool" },
+      "out": { "hostname": "str", "authenticated": "bool", "login": "str", "account_type": "str" },
       "errors": ["degraded-backend"],
-      "examples": [{ "payload": {}, "result": { "ok": true, "hostname": "github.com", "authenticated": true } }]
+      "examples": [{ "payload": {}, "result": { "ok": true, "hostname": "github.com", "authenticated": true, "login": "automation-bot", "account_type": "Bot" } }]
     },
     "auth/command/import-to-vault": {
       "version": "v1",
@@ -105,6 +105,33 @@
           "result": { "ok": true, "module": "urirun", "scheme": "urirun", "bindings": {} }
         }
       ]
+    },
+    "repo/collaborator/command/invite": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {"owner": "str", "repo": "str", "username": "str", "permission": "?str"},
+      "out": {"owner": "str", "repo": "str", "username": "str", "permission": "str", "invited": "bool"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"owner": "example-org", "repo": "education-sandbox", "username": "intern", "permission": "triage"}, "result": {"ok": true, "owner": "example-org", "repo": "education-sandbox", "username": "intern", "permission": "triage", "invited": true}}]
+    },
+    "issue/command/create": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {"owner": "str", "repo": "str", "title": "str", "body": "?str", "labels": "?list", "assignees": "?list"},
+      "out": {"owner": "str", "repo": "str", "number": "int", "url": "?str", "created": "bool"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"owner": "example-org", "repo": "education-sandbox", "title": "First educational task"}, "result": {"ok": true, "owner": "example-org", "repo": "education-sandbox", "number": 1, "url": "https://github.com/example-org/education-sandbox/issues/1", "created": true}}]
+    },
+    "issue/command/assign": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {"owner": "str", "repo": "str", "number": "int", "assignees": "list"},
+      "out": {"owner": "str", "repo": "str", "number": "int", "assignees": "list", "url": "?str"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"owner": "example-org", "repo": "education-sandbox", "number": 1, "assignees": ["intern"]}, "result": {"ok": true, "owner": "example-org", "repo": "education-sandbox", "number": 1, "assignees": ["intern"], "url": "https://github.com/example-org/education-sandbox/issues/1"}}]
     }
   },
   "wires": []

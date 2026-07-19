@@ -39,6 +39,48 @@ from . import _urirun_compat
 
 CONNECTOR_ID = "github"
 conn = _urirun_compat.connector(CONNECTOR_ID, scheme="github")
+_SAFE_SLUG = __import__("re").compile(r"^[A-Za-z0-9_.-]{1,100}$")
+
+
+def _token() -> str:
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        return token
+    token = _lease_github_token()
+    if token:
+        return token
+    proc = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise RuntimeError("github_auth_unavailable")
+    return proc.stdout.strip()
+
+
+def _api(method: str, path: str, body: Any = None) -> tuple[int, Any]:
+    if not path.startswith("/") or ".." in path or "?" in path:
+        raise RuntimeError("github_api_path_invalid")
+    token = _token()
+    request = urllib.request.Request(
+        f"https://api.github.com{path}", method=method,
+        data=None if body is None else json.dumps(body).encode("utf-8"),
+        headers={"accept":"application/vnd.github+json","authorization":f"Bearer {token}","x-github-api-version":"2022-11-28","content-type":"application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw=response.read().decode("utf-8")
+            return response.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as error:
+        raw=error.read().decode("utf-8",errors="replace")
+        try: data=json.loads(raw) if raw else {}
+        except json.JSONDecodeError: data={"message":"invalid_response"}
+        return error.code,data
+    finally:
+        token=""
+
+
+def _repo_path(owner: str, repo: str, suffix: str = "") -> str:
+    if not _SAFE_SLUG.fullmatch(owner or "") or not _SAFE_SLUG.fullmatch(repo or ""):
+        raise RuntimeError("github_repo_slug_invalid")
+    return f"/repos/{owner}/{repo}{suffix}"
 
 
 def _root() -> Path:
@@ -207,10 +249,20 @@ def repo_bindings(dest: str = "", module: str = "") -> dict[str, Any]:
     return urirun.fail("no `module` given and no *.bindings.json found in the repo")
 
 
-@conn.handler("auth/query/status", isolated=True, meta={"label": "Check GitHub CLI authentication"})
+@conn.handler("auth/query/status", isolated=True, meta={"label": "Verify GitHub API authentication"})
 def auth_status(hostname: str = "github.com") -> dict[str, Any]:
-    proc = _gh(["auth", "status", "--hostname", hostname], timeout=30)
-    return urirun.ok(hostname=hostname, authenticated=proc.returncode == 0)
+    try:
+        status, data = _api("GET", "/user")
+    except RuntimeError as error:
+        return urirun.fail(str(error), hostname=hostname, authenticated=False)
+    if status != 200:
+        return urirun.fail(f"github_auth_failed:{status}", hostname=hostname, authenticated=False)
+    return urirun.ok(
+        hostname=hostname,
+        authenticated=True,
+        login=str(data.get("login") or ""),
+        account_type=str(data.get("type") or ""),
+    )
 
 
 @conn.handler("auth/command/import-to-vault", isolated=True, meta={"label": "Validate gh token and store it in vault"})
@@ -275,6 +327,63 @@ def create_repo(
     if proc.returncode != 0:
         return urirun.fail("github_repository_create_failed", repository=repository)
     return urirun.ok(repository=repository, url=f"https://{hostname}/{repository}", created=True)
+
+
+@conn.handler("repo/collaborator/command/invite", isolated=True, meta={"label": "Invite a least-privilege repository collaborator"})
+def invite_collaborator(owner: str = "", repo: str = "", username: str = "", permission: str = "triage") -> dict[str, Any]:
+    if not _SAFE_SLUG.fullmatch(username or "") or permission not in {"pull", "triage", "push", "maintain"}:
+        return urirun.fail("github_collaborator_input_invalid")
+    try:
+        path = _repo_path(owner, repo, f"/collaborators/{username}")
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    status, data = _api("PUT", path, {"permission": permission})
+    if status not in {201, 204}:
+        return urirun.fail(f"github_collaborator_invite_failed:{status}")
+    return urirun.ok(
+        owner=owner,
+        repo=repo,
+        username=username,
+        permission=permission,
+        invitation_id=data.get("id"),
+        invited=status == 201,
+        already_authorized=status == 204,
+    )
+
+
+@conn.handler("issue/command/create", isolated=True, meta={"label": "Create a governed GitHub issue"})
+def create_issue(owner: str = "", repo: str = "", title: str = "", body: str = "", labels: list[str] | None = None, assignees: list[str] | None = None) -> dict[str, Any]:
+    if not title.strip():
+        return urirun.fail("github_issue_title_required")
+    try:
+        path = _repo_path(owner, repo, "/issues")
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    payload = {
+        "title": title[:256],
+        "body": body[:60000],
+        "labels": [str(item)[:100] for item in (labels or [])],
+        "assignees": [str(item) for item in (assignees or []) if _SAFE_SLUG.fullmatch(str(item))],
+    }
+    status, data = _api("POST", path, payload)
+    if status != 201:
+        return urirun.fail(f"github_issue_create_failed:{status}")
+    return urirun.ok(owner=owner, repo=repo, number=data.get("number"), url=data.get("html_url"), created=True)
+
+
+@conn.handler("issue/command/assign", isolated=True, meta={"label": "Assign a governed GitHub issue"})
+def assign_issue(owner: str = "", repo: str = "", number: int = 0, assignees: list[str] | None = None) -> dict[str, Any]:
+    clean = [str(item) for item in (assignees or []) if _SAFE_SLUG.fullmatch(str(item))]
+    if int(number or 0) < 1 or not clean:
+        return urirun.fail("github_issue_assignment_invalid")
+    try:
+        path = _repo_path(owner, repo, f"/issues/{int(number)}/assignees")
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    status, data = _api("POST", path, {"assignees": clean})
+    if status != 201:
+        return urirun.fail(f"github_issue_assign_failed:{status}")
+    return urirun.ok(owner=owner, repo=repo, number=int(number), assignees=clean, url=data.get("html_url"))
 
 
 # --- authoring surface -----------------------------------------------------

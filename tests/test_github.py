@@ -8,8 +8,9 @@ import subprocess
 
 import urirun
 from urirun_connector_github import (
-    auth_status, clone, connector_manifest, create_repo, import_gh_token_to_vault,
-    install, list_repos, pull, repo_bindings, urirun_bindings,
+    assign_issue, auth_status, clone, connector_manifest, create_issue,
+    create_repo, import_gh_token_to_vault, install, invite_collaborator,
+    list_repos, pull, repo_bindings, urirun_bindings,
 )
 import urirun_connector_github.core as core
 
@@ -18,7 +19,8 @@ ROUTES = {
     "github://host/repo/query/list", "github://host/package/command/install",
     "github://host/repo/query/bindings", "github://host/repo/command/create",
     "github://host/auth/query/status", "github://host/auth/command/import-to-vault",
-    "github://host/doctor/query/report",
+    "github://host/repo/collaborator/command/invite", "github://host/issue/command/create",
+    "github://host/issue/command/assign", "github://host/doctor/query/report",
 }
 
 
@@ -78,7 +80,7 @@ def test_repo_bindings_from_file(tmp_path):
 
 
 def test_auth_status_never_returns_token(monkeypatch):
-    monkeypatch.setattr(core, "_gh", lambda args, timeout=120: subprocess.CompletedProcess(args, 0, "token-value", ""))
+    monkeypatch.setattr(core, "_api", lambda method, path: (200, {"login": "bot", "type": "Bot"}))
     result = auth_status()
     assert result["authenticated"] is True
     assert "token" not in result
@@ -128,3 +130,25 @@ def test_manifest():
     m = connector_manifest()
     assert m["id"] == "github" and m["uriSchemes"] == ["github"]
     assert set(m["routes"]) == ROUTES
+    assert "github.com/urirun-connectors/" in m["install"]["pipSpec"]
+
+
+def test_api_operations_are_structured_and_least_privilege(monkeypatch):
+    calls=[]
+    def fake_api(method,path,body=None):
+        calls.append((method,path,body))
+        if path=="/user": return 200,{"login":"bot","type":"Bot"}
+        if path.endswith("/collaborators/intern"): return 201,{"id":7}
+        if path.endswith("/assignees"): return 201,{"html_url":"https://example/issues/3"}
+        if path.endswith("/issues"): return 201,{"number":3,"html_url":"https://example/issues/3"}
+        return 201,{"html_url":"https://example/repo"}
+    monkeypatch.setattr(core,"_api",fake_api)
+    assert auth_status()["authenticated"]
+    assert invite_collaborator(owner="org",repo="sandbox",username="intern",permission="triage")["invited"]
+    assert create_issue(owner="org",repo="sandbox",title="First task",labels=["education"])["number"]==3
+    assert assign_issue(owner="org",repo="sandbox",number=3,assignees=["intern"])["ok"]
+    assert calls[1][2]["permission"]=="triage"
+
+
+def test_collaborator_rejects_admin_permission():
+    assert invite_collaborator(owner="org",repo="repo",username="intern",permission="admin")["ok"] is False

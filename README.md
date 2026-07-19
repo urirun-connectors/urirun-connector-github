@@ -35,6 +35,13 @@ If `gh auth status` reports an invalid token, the import is refused. Re-run
 
 Clones land under `URIRUN_PROJECTS` (default `~/.urirun-projects`).
 
+## Governed organization operations
+
+Subactor company workflows can also verify authentication, create organization
+repositories, invite least-privilege collaborators, and create or assign
+issues. The connector deliberately rejects the `admin` collaborator grant and
+never emits the GitHub token in its evidence.
+
 ## Why
 
 It closes the loop for the mesh: a node can pull a new connector/pack/project
