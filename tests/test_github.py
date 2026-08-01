@@ -86,6 +86,21 @@ def test_auth_status_never_returns_token(monkeypatch):
     assert "token" not in result
 
 
+def test_github_token_resolves_only_a_reference(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("GITHUB_TOKEN_REF", "getv://GITHUB_TOKEN")
+    assert core._secret_reference(
+        "GITHUB_TOKEN_REF", core._GITHUB_TOKEN_REF, "github_token"
+    ) == "github-secret"
+    monkeypatch.setenv("GITHUB_TOKEN_REF", "literal-token")
+    try:
+        core._secret_reference("GITHUB_TOKEN_REF", core._GITHUB_TOKEN_REF, "github_token")
+    except RuntimeError as error:
+        assert str(error) == "github_token_ref_invalid"
+    else:
+        raise AssertionError("literal token reference must be rejected")
+
+
 def test_gh_uses_short_vault_lease_without_exposing_token(monkeypatch):
     calls = {}
     monkeypatch.delenv("GH_TOKEN", raising=False)

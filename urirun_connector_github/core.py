@@ -40,10 +40,27 @@ from . import _urirun_compat
 CONNECTOR_ID = "github"
 conn = _urirun_compat.connector(CONNECTOR_ID, scheme="github")
 _SAFE_SLUG = __import__("re").compile(r"^[A-Za-z0-9_.-]{1,100}$")
+_GITHUB_TOKEN_REF = "getv://GITHUB_TOKEN"
+_VAULT_TOKEN_REF = "getv://URIRUN_VAULT_TOKEN"
+
+
+def _secret_reference(env_name: str, default_reference: str, error_prefix: str) -> str:
+    reference = os.environ.get(env_name, default_reference).strip()
+    if not reference.startswith(("getv://", "secret://", "{getv:", "{secret:")):
+        raise RuntimeError(f"{error_prefix}_ref_invalid")
+    try:
+        return urirun.resolve_secret(
+            reference,
+            secret_allow=os.environ.get("URIRUN_SECRET_ALLOW", default_reference),
+        )
+    except KeyError:
+        return ""
+    except PermissionError as error:
+        raise RuntimeError(f"{error_prefix}_ref_denied") from error
 
 
 def _token() -> str:
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    token = _secret_reference("GITHUB_TOKEN_REF", _GITHUB_TOKEN_REF, "github_token")
     if token:
         return token
     token = _lease_github_token()
@@ -98,7 +115,7 @@ def _git(args: list[str], timeout: float = 300.0) -> subprocess.CompletedProcess
 
 def _lease_github_token() -> str:
     vault_url = os.environ.get("URIRUN_VAULT_URL", "").rstrip("/")
-    vault_token = os.environ.get("URIRUN_VAULT_TOKEN", "")
+    vault_token = _secret_reference("URIRUN_VAULT_TOKEN_REF", _VAULT_TOKEN_REF, "github_vault_token")
     entry_id = os.environ.get("GITHUB_VAULT_ENTRY_ID", "github-cli-runtime")
     if not vault_url or not vault_token:
         return ""
@@ -123,7 +140,7 @@ def _lease_github_token() -> str:
 def _gh(args: list[str], timeout: float = 120.0, *, use_vault: bool = True) -> subprocess.CompletedProcess:
     token = ""
     try:
-        token = _lease_github_token() if use_vault and not os.environ.get("GH_TOKEN") else ""
+        token = _lease_github_token() if use_vault else ""
         env = dict(os.environ)
         if token:
             env["GH_TOKEN"] = token
@@ -281,7 +298,9 @@ def import_gh_token_to_vault(
         identity = _github_identity(token, api_url)
         stored_id = _store_token_in_vault(
             vault_url=vault_url or os.environ.get("URIRUN_VAULT_URL", ""),
-            vault_token=os.environ.get("URIRUN_VAULT_TOKEN", ""),
+            vault_token=_secret_reference(
+                "URIRUN_VAULT_TOKEN_REF", _VAULT_TOKEN_REF, "github_vault_token"
+            ),
             entry_id=vault_entry_id,
             origin=f"https://{hostname}",
             token=token,
