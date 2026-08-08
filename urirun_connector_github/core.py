@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import urirun
+from urirun_connector_forge import account_twin, twin_fact
 
 from . import _urirun_compat
 
@@ -72,12 +73,12 @@ def _token() -> str:
     return proc.stdout.strip()
 
 
-def _api(method: str, path: str, body: Any = None) -> tuple[int, Any]:
+def _api(method: str, path: str, body: Any = None, query: dict[str, Any] | None = None) -> tuple[int, Any]:
     if not path.startswith("/") or ".." in path or "?" in path:
         raise RuntimeError("github_api_path_invalid")
     token = _token()
     request = urllib.request.Request(
-        f"https://api.github.com{path}", method=method,
+        f"https://api.github.com{path}" + ("?" + urllib.parse.urlencode(query) if query else ""), method=method,
         data=None if body is None else json.dumps(body).encode("utf-8"),
         headers={"accept":"application/vnd.github+json","authorization":f"Bearer {token}","x-github-api-version":"2022-11-28","content-type":"application/json"},
     )
@@ -282,6 +283,76 @@ def auth_status(hostname: str = "github.com") -> dict[str, Any]:
     )
 
 
+def _pages(path: str, query: dict[str, Any], max_items: int) -> tuple[list[Any], bool, int]:
+    rows: list[Any] = []
+    page = 1
+    requests = 0
+    while len(rows) < max_items:
+        page_size = min(100, max_items - len(rows))
+        status, payload = _api("GET", path, query={**query, "page": page, "per_page": page_size})
+        requests += 1
+        if status != 200:
+            raise RuntimeError(f"github_twin_query_failed:{status}")
+        rows.extend(payload)
+        if len(payload) < page_size:
+            return rows[:max_items], True, requests
+        page += 1
+    return rows[:max_items], False, requests
+
+
+@conn.handler("account/query/twin", isolated=True, meta={"label": "Map visible GitHub account resources"})
+def account_query_twin(max_items: int = 1000, instance_id: str = "github.com") -> dict[str, Any]:
+    try:
+        if not 1 <= int(max_items) <= 5000:
+            raise ValueError("forge_twin_limit_invalid")
+        status, user = _api("GET", "/user")
+        if status != 200:
+            raise RuntimeError(f"github_auth_failed:{status}")
+        organizations, organizations_complete, organization_requests = _pages(
+            "/user/orgs", {}, int(max_items)
+        )
+        repositories, repositories_complete, repository_requests = _pages(
+            "/user/repos", {"affiliation": "owner,collaborator,organization_member", "sort": "full_name"}, int(max_items)
+        )
+        personal_id = f"user:{user.get('id')}"
+        twin = account_twin(
+            provider="github", instance_id=instance_id.strip() or "github.com",
+            subject={"id": str(user.get("id", "")), "username": user.get("login", ""),
+                     "display_name": user.get("name", ""), "account_type": user.get("type", "user")},
+            scopes=[{
+                "id": personal_id, "name": user.get("login", ""), "kind": "user",
+                "role": "owner", "private": False, "url": user.get("html_url", ""), "parent_id": "",
+            }, *[{
+                "id": f"organization:{row.get('id')}", "name": row.get("login", ""),
+                "kind": "organization", "role": "member", "private": False,
+                "url": row.get("html_url", ""), "parent_id": "",
+            } for row in organizations]],
+            repositories=[{
+                "id": f"repository:{row.get('id')}", "full_name": row.get("full_name", ""),
+                "scope_id": (f"organization:{(row.get('organization') or {}).get('id')}"
+                             if row.get("organization") else personal_id),
+                "project_id": "", "default_branch": row.get("default_branch") or "",
+                "visibility": row.get("visibility") or ("private" if row.get("private") else "public"),
+                "archived": bool(row.get("archived")), "fork": bool(row.get("fork")),
+                "url": row.get("html_url", ""), "updated_at": row.get("updated_at", ""),
+                "size_bytes": int(row.get("size") or 0) * 1024,
+                "features": [name for name, enabled in {
+                    "issues": row.get("has_issues"), "projects": row.get("has_projects"),
+                    "wiki": row.get("has_wiki"), "pages": row.get("has_pages"),
+                    "discussions": row.get("has_discussions"), "actions": True,
+                    "pull_requests": True,
+                }.items() if enabled],
+            } for row in repositories],
+            capabilities={"organizations": True, "pull_requests": True, "actions": True,
+                          "packages": True, "pages": True, "self_managed": False},
+            complete=organizations_complete and repositories_complete,
+            requests=1 + organization_requests + repository_requests,
+        )
+        return urirun.ok(**twin, twin_fact=twin_fact(twin, "github://host/account/query/twin"))
+    except (RuntimeError, ValueError) as error:
+        return urirun.fail(str(error), provider="github", mutation_attempted=False)
+
+
 @conn.handler("auth/command/import-to-vault", isolated=True, meta={"label": "Validate gh token and store it in vault"})
 def import_gh_token_to_vault(
     hostname: str = "github.com",
@@ -427,7 +498,7 @@ def _connector_version() -> str:
 
         return version("urirun-connector-github")
     except Exception:
-        return "0.2.0"
+        return "0.3.0"
 
 
 def connector_manifest() -> dict[str, Any]:

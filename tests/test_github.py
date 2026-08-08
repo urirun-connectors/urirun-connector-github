@@ -8,7 +8,7 @@ import subprocess
 
 import urirun
 from urirun_connector_github import (
-    assign_issue, auth_status, clone, connector_manifest, create_issue,
+    account_query_twin, assign_issue, auth_status, clone, connector_manifest, create_issue,
     create_repo, import_gh_token_to_vault, install, invite_collaborator,
     list_repos, pull, repo_bindings, urirun_bindings,
 )
@@ -19,6 +19,7 @@ ROUTES = {
     "github://host/repo/query/list", "github://host/package/command/install",
     "github://host/repo/query/bindings", "github://host/repo/command/create",
     "github://host/auth/query/status", "github://host/auth/command/import-to-vault",
+    "github://host/account/query/twin",
     "github://host/repo/collaborator/command/invite", "github://host/issue/command/create",
     "github://host/issue/command/assign", "github://host/doctor/query/report",
 }
@@ -167,3 +168,21 @@ def test_api_operations_are_structured_and_least_privilege(monkeypatch):
 
 def test_collaborator_rejects_admin_permission():
     assert invite_collaborator(owner="org",repo="repo",username="intern",permission="admin")["ok"] is False
+
+
+def test_account_twin_maps_organizations_and_repositories(monkeypatch):
+    def fake_api(method, path, body=None, query=None):
+        if path == "/user":
+            return 200, {"id": 1, "login": "tom", "name": "Tom", "type": "User"}
+        if path == "/user/orgs":
+            return 200, [{"id": 2, "login": "subactor", "html_url": "https://github.com/subactor"}]
+        if path == "/user/repos":
+            return 200, [{"id": 3, "full_name": "subactor/core", "default_branch": "main",
+                          "visibility": "private", "organization": {"id": 2}, "has_issues": True}]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(core, "_api", fake_api)
+    result = account_query_twin()
+    assert result["ok"] and result["counts"] == {"scopes": 2, "repositories": 1}
+    assert result["twin_fact"]["twin_type"] == "forge.account"
+    assert result["mutation_attempted"] is False

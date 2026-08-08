@@ -124,6 +124,15 @@
       "errors": ["precondition-unmet", "degraded-backend"],
       "examples": [{"payload": {"owner": "example-org", "repo": "education-sandbox", "title": "First educational task"}, "result": {"ok": true, "owner": "example-org", "repo": "education-sandbox", "number": 1, "url": "https://github.com/example-org/education-sandbox/issues/1", "created": true}}]
     },
+    "account/query/twin": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"max_items": "?int", "instance_id": "?str"},
+      "out": {"schema": "str", "provider": "str", "instance_id": "str", "subject": {}, "scopes": "list", "repositories": "list", "capabilities": {}, "counts": {}, "collection": {}, "map_hash": "str", "observed_at": "str", "mutation_attempted": "bool", "twin_fact": {}},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {}, "result": {"ok": true, "schema": "urirun.forge-account-twin/v1", "provider": "github", "instance_id": "github.com", "subject": {}, "scopes": [], "repositories": [], "capabilities": {}, "counts": {}, "collection": {}, "map_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "observed_at": "2026-08-08T12:00:00Z", "mutation_attempted": false, "twin_fact": {}}}]
+    },
     "issue/command/assign": {
       "version": "v1",
       "effect": "command",

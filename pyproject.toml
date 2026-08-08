@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "urirun-connector-github"
-version = "0.2.0"
+version = "0.3.0"
 description = "GitHub/git connector for ifuri and urirun — clone repos and deploy via bindings/registry anywhere"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "if-uri" }]
-dependencies = ["urirun>=0.4.14"]
+dependencies = [
+  "urirun>=0.4.14",
+  "urirun-connector-forge @ git+https://github.com/urirun-connectors/urirun-connector-forge.git@main",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

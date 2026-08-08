@@ -23,7 +23,7 @@
   ],
   "install": {
     "mode": "urirun-extra",
-    "pipSpec": "urirun-connector-github @ git+https://github.com/urirun-connectors/urirun-connector-github.git@v0.2.0"
+    "pipSpec": "urirun-connector-github @ git+https://github.com/urirun-connectors/urirun-connector-github.git@main"
   },
   "provenance": "verified",
   "publisher": {
@@ -47,6 +47,7 @@
   "routes": [
     "github://host/auth/command/import-to-vault",
     "github://host/auth/query/status",
+    "github://host/account/query/twin",
     "github://host/doctor/query/report",
     "github://host/package/command/install",
     "github://host/issue/command/assign",
