@@ -58,7 +58,10 @@
     "github://host/repo/command/pull",
     "github://host/repo/collaborator/command/invite",
     "github://host/repo/query/bindings",
-    "github://host/repo/query/list"
+    "github://host/repo/query/list",
+    "github://host/validator/initial-ref/command/dispatch",
+    "github://host/validator/initial-ref/query/receipt",
+    "github://host/validator/initial-ref/query/run"
   ],
   "examples": [
     {

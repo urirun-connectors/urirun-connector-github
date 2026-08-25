@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "urirun-connector-github"
-version = "0.3.0"
+version = "0.4.0"
 description = "GitHub/git connector for ifuri and urirun — clone repos and deploy via bindings/registry anywhere"
 readme = "README.md"
 requires-python = ">=3.10"

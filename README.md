@@ -16,6 +16,9 @@ machine**.
 | `github://host/auth/query/status` | check `gh` authentication without exposing a token |
 | `github://host/auth/command/import-to-vault` | validate the active `gh` token and store it in vault |
 | `github://host/repo/command/create` | create a repository through `gh repo create` |
+| `github://host/validator/initial-ref/command/dispatch` | dispatch the fixed protected initial-ref Validator workflow |
+| `github://host/validator/initial-ref/query/run` | observe the exactly bound Validator run |
+| `github://host/validator/initial-ref/query/receipt` | load and verify the attested Validator receipt |
 
 ## GitHub CLI token and vault
 
@@ -43,6 +46,14 @@ environment and cannot be expanded by a URI payload, Planfile ticket or LLM.
 Broad local profiles containing scopes such as `admin:org` or `delete_repo`
 must not be imported; use a repository-scoped GitHub App installation token for
 normal autonomous execution.
+
+The initial-ref routes are intentionally not a generic Actions runner. They fix
+the repository to `subactor/validator-agent`, the workflow to `validator.yml`,
+the ref to `main`, and the artifact to `validator-agent-result`. Every request
+must carry the exact Orchestrator binding, dispatch is deduplicated by run
+identity, and terminal evidence is accepted only after `gh attestation verify`
+binds it to the protected workflow SHA. Credentials come from a short,
+origin-bound Vault lease and are never accepted in the route payload.
 
 Clones land under `URIRUN_PROJECTS` (default `~/.urirun-projects`).
 
