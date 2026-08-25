@@ -36,6 +36,14 @@ urirun run 'github://host/auth/command/import-to-vault' \
 If `gh auth status` reports an invalid token, the import is refused. Re-run
 `gh auth login -h github.com` before retrying.
 
+Bootstrap import also fails closed when GitHub reports no verifiable classic
+OAuth scopes or any scope outside `GITHUB_BOOTSTRAP_ALLOWED_SCOPES` (default:
+`repo,read:org,workflow`). The allowlist belongs to the trusted runtime
+environment and cannot be expanded by a URI payload, Planfile ticket or LLM.
+Broad local profiles containing scopes such as `admin:org` or `delete_repo`
+must not be imported; use a repository-scoped GitHub App installation token for
+normal autonomous execution.
+
 Clones land under `URIRUN_PROJECTS` (default `~/.urirun-projects`).
 
 ## Governed organization operations

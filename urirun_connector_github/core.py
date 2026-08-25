@@ -41,8 +41,10 @@ from . import _urirun_compat
 CONNECTOR_ID = "github"
 conn = _urirun_compat.connector(CONNECTOR_ID, scheme="github")
 _SAFE_SLUG = __import__("re").compile(r"^[A-Za-z0-9_.-]{1,100}$")
+_SAFE_SCOPE = re.compile(r"^[a-z][a-z0-9:_-]{0,63}$")
 _GITHUB_TOKEN_REF = "getv://GITHUB_TOKEN"
 _VAULT_TOKEN_REF = "getv://URIRUN_VAULT_TOKEN"
+_DEFAULT_BOOTSTRAP_ALLOWED_SCOPES = frozenset({"repo", "read:org", "workflow"})
 
 
 def _secret_reference(env_name: str, default_reference: str, error_prefix: str) -> str:
@@ -181,6 +183,29 @@ def _github_identity(token: str, api_url: str = "https://api.github.com") -> dic
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as error:
         raise RuntimeError("github_token_validation_failed") from error
     return {"login": str(data.get("login") or ""), "scopes": scopes}
+
+
+def _validate_bootstrap_scopes(scopes: list[str]) -> list[str]:
+    """Reject a gh bootstrap token whose effective classic scopes exceed policy.
+
+    GitHub does not expose fine-grained token permissions through the legacy
+    ``X-OAuth-Scopes`` header. An empty list is therefore unverifiable here and
+    remains fail-closed; production execution should use a repository-scoped
+    GitHub App installation token instead.
+    """
+    observed = sorted(set(scopes))
+    if not observed or any(not _SAFE_SCOPE.fullmatch(scope) for scope in observed):
+        raise RuntimeError("github_token_scopes_unverifiable")
+    configured = os.environ.get(
+        "GITHUB_BOOTSTRAP_ALLOWED_SCOPES",
+        ",".join(sorted(_DEFAULT_BOOTSTRAP_ALLOWED_SCOPES)),
+    )
+    allowed = {item.strip() for item in configured.split(",") if item.strip()}
+    if not allowed or any(not _SAFE_SCOPE.fullmatch(scope) for scope in allowed):
+        raise RuntimeError("github_bootstrap_scope_policy_invalid")
+    if set(observed) - allowed:
+        raise RuntimeError("github_token_scope_excessive")
+    return observed
 
 
 def _store_token_in_vault(*, vault_url: str, vault_token: str, entry_id: str, origin: str, token: str) -> str:
@@ -505,6 +530,7 @@ def import_gh_token_to_vault(
         return urirun.fail("github_cli_token_unavailable")
     try:
         identity = _github_identity(token, api_url)
+        identity["scopes"] = _validate_bootstrap_scopes(identity["scopes"])
         stored_id = _store_token_in_vault(
             vault_url=vault_url or os.environ.get("URIRUN_VAULT_URL", ""),
             vault_token=_secret_reference(

@@ -151,6 +151,45 @@ def test_import_gh_token_validates_and_stores_without_returning_secret(monkeypat
     assert "secret-token" not in json.dumps(result)
 
 
+def test_import_gh_token_rejects_excessive_scopes_before_vault_write(monkeypatch):
+    writes = []
+    monkeypatch.setattr(core, "_gh", lambda args, timeout=120, **kwargs: subprocess.CompletedProcess(args, 0, "secret-token\n", ""))
+    monkeypatch.setattr(
+        core,
+        "_github_identity",
+        lambda token, api_url: {"login": "founder", "scopes": ["repo", "admin:org", "delete_repo"]},
+    )
+    monkeypatch.setattr(core, "_store_token_in_vault", lambda **kwargs: writes.append(kwargs))
+
+    result = import_gh_token_to_vault(vault_url="http://vault")
+
+    assert result["ok"] is False
+    assert result["error"] == "github_token_scope_excessive"
+    assert writes == []
+    assert "secret-token" not in json.dumps(result)
+
+
+def test_import_gh_token_rejects_unverifiable_scopes(monkeypatch):
+    monkeypatch.setattr(core, "_gh", lambda args, timeout=120, **kwargs: subprocess.CompletedProcess(args, 0, "secret-token\n", ""))
+    monkeypatch.setattr(core, "_github_identity", lambda token, api_url: {"login": "founder", "scopes": []})
+
+    result = import_gh_token_to_vault(vault_url="http://vault")
+
+    assert result["ok"] is False
+    assert result["error"] == "github_token_scopes_unverifiable"
+
+
+def test_bootstrap_scope_policy_is_closed_and_environment_owned(monkeypatch):
+    assert core._validate_bootstrap_scopes(["workflow", "repo", "repo"]) == ["repo", "workflow"]
+    monkeypatch.setenv("GITHUB_BOOTSTRAP_ALLOWED_SCOPES", "repo,invalid scope")
+    try:
+        core._validate_bootstrap_scopes(["repo"])
+    except RuntimeError as error:
+        assert str(error) == "github_bootstrap_scope_policy_invalid"
+    else:
+        raise AssertionError("invalid bootstrap scope policy must fail closed")
+
+
 def test_create_repo_uses_gh_without_exposing_credentials(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(core, "_gh", lambda args, timeout=120: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""))
