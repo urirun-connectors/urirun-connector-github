@@ -19,9 +19,12 @@ machine**.
 
 ## GitHub CLI token and vault
 
-The token is read only from `gh auth token`; it is never accepted in the URI
-payload and never returned in a result. The import process validates it against
-GitHub `/user`, then stores it as `api_key` in the configured vault:
+Normal execution leases the token from the configured origin-bound Vault first.
+An allowlisted environment reference and then `gh auth token` are bootstrap
+fallbacks only when Vault is not configured; a configured but failed Vault
+lease remains fail-closed. The token is never accepted in the URI payload and
+never returned in a result. The import process validates a bootstrap token
+against GitHub `/user`, then stores it as `api_key` in the configured vault:
 
 ```bash
 export URIRUN_VAULT_URL=http://127.0.0.1:8130
@@ -32,6 +35,14 @@ urirun run 'github://host/auth/command/import-to-vault' \
 
 If `gh auth status` reports an invalid token, the import is refused. Re-run
 `gh auth login -h github.com` before retrying.
+
+Bootstrap import also fails closed when GitHub reports no verifiable classic
+OAuth scopes or any scope outside `GITHUB_BOOTSTRAP_ALLOWED_SCOPES` (default:
+`repo,read:org,workflow`). The allowlist belongs to the trusted runtime
+environment and cannot be expanded by a URI payload, Planfile ticket or LLM.
+Broad local profiles containing scopes such as `admin:org` or `delete_repo`
+must not be imported; use a repository-scoped GitHub App installation token for
+normal autonomous execution.
 
 Clones land under `URIRUN_PROJECTS` (default `~/.urirun-projects`).
 

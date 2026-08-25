@@ -10,7 +10,7 @@ import urirun
 from urirun_connector_github import (
     account_query_twin, assign_issue, auth_status, clone, connector_manifest, create_issue,
     create_repo, import_gh_token_to_vault, install, invite_collaborator,
-    list_repos, pull, repo_bindings, urirun_bindings,
+    list_issues, list_repos, pull, repo_bindings, urirun_bindings,
 )
 import urirun_connector_github.core as core
 
@@ -21,7 +21,8 @@ ROUTES = {
     "github://host/auth/query/status", "github://host/auth/command/import-to-vault",
     "github://host/account/query/twin",
     "github://host/repo/collaborator/command/invite", "github://host/issue/command/create",
-    "github://host/issue/command/assign", "github://host/doctor/query/report",
+    "github://host/issue/command/assign", "github://host/issue/query/list",
+    "github://host/doctor/query/report",
 }
 
 
@@ -102,10 +103,33 @@ def test_github_token_resolves_only_a_reference(monkeypatch):
         raise AssertionError("literal token reference must be rejected")
 
 
+def test_api_token_prefers_auditable_vault_lease(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        core,
+        "_lease_github_token",
+        lambda **context: calls.append(("vault", context)) or "leased-token",
+    )
+    monkeypatch.setattr(
+        core,
+        "_secret_reference",
+        lambda *args, **kwargs: calls.append(("env", {})) or "environment-token",
+    )
+
+    assert core._token(purpose="github.issue.query", target="provider:github") == "leased-token"
+    assert calls == [("vault", {"purpose": "github.issue.query", "target": "provider:github"})]
+
+
+def test_api_token_uses_declared_environment_reference_only_without_vault(monkeypatch):
+    monkeypatch.setattr(core, "_lease_github_token", lambda **context: "")
+    monkeypatch.setattr(core, "_secret_reference", lambda *args, **kwargs: "environment-token")
+    assert core._token() == "environment-token"
+
+
 def test_gh_uses_short_vault_lease_without_exposing_token(monkeypatch):
     calls = {}
     monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.setattr(core, "_lease_github_token", lambda: "short-lived-secret")
+    monkeypatch.setattr(core, "_lease_github_token", lambda **context: "short-lived-secret")
 
     def fake_run(command, **kwargs):
         calls.update(command=command, env=kwargs["env"])
@@ -125,6 +149,45 @@ def test_import_gh_token_validates_and_stores_without_returning_secret(monkeypat
     result = import_gh_token_to_vault(vault_url="http://vault")
     assert result["ok"] and result["token_stored"] and result["login"] == "founder"
     assert "secret-token" not in json.dumps(result)
+
+
+def test_import_gh_token_rejects_excessive_scopes_before_vault_write(monkeypatch):
+    writes = []
+    monkeypatch.setattr(core, "_gh", lambda args, timeout=120, **kwargs: subprocess.CompletedProcess(args, 0, "secret-token\n", ""))
+    monkeypatch.setattr(
+        core,
+        "_github_identity",
+        lambda token, api_url: {"login": "founder", "scopes": ["repo", "admin:org", "delete_repo"]},
+    )
+    monkeypatch.setattr(core, "_store_token_in_vault", lambda **kwargs: writes.append(kwargs))
+
+    result = import_gh_token_to_vault(vault_url="http://vault")
+
+    assert result["ok"] is False
+    assert result["error"] == "github_token_scope_excessive"
+    assert writes == []
+    assert "secret-token" not in json.dumps(result)
+
+
+def test_import_gh_token_rejects_unverifiable_scopes(monkeypatch):
+    monkeypatch.setattr(core, "_gh", lambda args, timeout=120, **kwargs: subprocess.CompletedProcess(args, 0, "secret-token\n", ""))
+    monkeypatch.setattr(core, "_github_identity", lambda token, api_url: {"login": "founder", "scopes": []})
+
+    result = import_gh_token_to_vault(vault_url="http://vault")
+
+    assert result["ok"] is False
+    assert result["error"] == "github_token_scopes_unverifiable"
+
+
+def test_bootstrap_scope_policy_is_closed_and_environment_owned(monkeypatch):
+    assert core._validate_bootstrap_scopes(["workflow", "repo", "repo"]) == ["repo", "workflow"]
+    monkeypatch.setenv("GITHUB_BOOTSTRAP_ALLOWED_SCOPES", "repo,invalid scope")
+    try:
+        core._validate_bootstrap_scopes(["repo"])
+    except RuntimeError as error:
+        assert str(error) == "github_bootstrap_scope_policy_invalid"
+    else:
+        raise AssertionError("invalid bootstrap scope policy must fail closed")
 
 
 def test_create_repo_uses_gh_without_exposing_credentials(monkeypatch, tmp_path):
@@ -164,6 +227,52 @@ def test_api_operations_are_structured_and_least_privilege(monkeypatch):
     assert create_issue(owner="org",repo="sandbox",title="First task",labels=["education"])["number"]==3
     assert assign_issue(owner="org",repo="sandbox",number=3,assignees=["intern"])["ok"]
     assert calls[1][2]["permission"]=="triage"
+
+
+def test_issue_query_is_bounded_excludes_pull_requests_and_preserves_admission_metadata(monkeypatch):
+    calls = []
+
+    def fake_api(method, path, body=None, query=None, **context):
+        calls.append((method, path, query, context))
+        return 200, [
+            {
+                "number": 7,
+                "node_id": "I_fixture",
+                "title": "Implement bounded ingestion",
+                "body": "No credentials here",
+                "state": "open",
+                "html_url": "https://github.com/subactor/core/issues/7",
+                "user": {"login": "maintainer"},
+                "author_association": "MEMBER",
+                "labels": [{"name": "subactor:autonomy"}],
+                "assignees": [{"login": "automation-bot"}],
+                "created_at": "2026-08-25T10:00:00Z",
+                "updated_at": "2026-08-25T11:00:00Z",
+            },
+            {
+                "number": 8,
+                "title": "A pull request",
+                "pull_request": {"url": "https://api.github.com/pulls/8"},
+            },
+        ]
+
+    monkeypatch.setattr(core, "_api", fake_api)
+    result = list_issues(owner="subactor", repo="core", labels=["subactor:autonomy"], limit=10)
+    assert result["ok"] and result["count"] == 1 and result["complete"] is True
+    assert result["mutation_attempted"] is False
+    assert result["issues"][0]["author_association"] == "MEMBER"
+    assert result["issues"][0]["labels"] == ["subactor:autonomy"]
+    assert calls == [("GET", "/repos/subactor/core/issues", {
+        "state": "open", "sort": "updated", "direction": "desc",
+        "page": 1, "per_page": 100, "labels": "subactor:autonomy",
+    }, {"purpose": "github.issue.query", "target": "provider:github"})]
+
+
+def test_issue_query_rejects_unbounded_or_ambiguous_input(monkeypatch):
+    monkeypatch.setattr(core, "_api", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not call API")))
+    assert list_issues(owner="subactor", repo="core", limit=501)["ok"] is False
+    assert list_issues(owner="subactor", repo="core", state="pending")["ok"] is False
+    assert list_issues(owner="subactor", repo="core", since="yesterday")["ok"] is False
 
 
 def test_collaborator_rejects_admin_permission():

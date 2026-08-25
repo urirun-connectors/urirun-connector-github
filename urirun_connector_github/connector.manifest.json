@@ -52,6 +52,7 @@
     "github://host/package/command/install",
     "github://host/issue/command/assign",
     "github://host/issue/command/create",
+    "github://host/issue/query/list",
     "github://host/repo/command/clone",
     "github://host/repo/command/create",
     "github://host/repo/command/pull",

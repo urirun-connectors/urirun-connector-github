@@ -41,8 +41,10 @@ from . import _urirun_compat
 CONNECTOR_ID = "github"
 conn = _urirun_compat.connector(CONNECTOR_ID, scheme="github")
 _SAFE_SLUG = __import__("re").compile(r"^[A-Za-z0-9_.-]{1,100}$")
+_SAFE_SCOPE = re.compile(r"^[a-z][a-z0-9:_-]{0,63}$")
 _GITHUB_TOKEN_REF = "getv://GITHUB_TOKEN"
 _VAULT_TOKEN_REF = "getv://URIRUN_VAULT_TOKEN"
+_DEFAULT_BOOTSTRAP_ALLOWED_SCOPES = frozenset({"repo", "read:org", "workflow"})
 
 
 def _secret_reference(env_name: str, default_reference: str, error_prefix: str) -> str:
@@ -60,11 +62,14 @@ def _secret_reference(env_name: str, default_reference: str, error_prefix: str) 
         raise RuntimeError(f"{error_prefix}_ref_denied") from error
 
 
-def _token() -> str:
-    token = _secret_reference("GITHUB_TOKEN_REF", _GITHUB_TOKEN_REF, "github_token")
+def _token(*, purpose: str = "github.api", target: str = "provider:github") -> str:
+    # A configured Vault is the normal execution boundary. Environment and the
+    # local gh profile are bootstrap fallbacks only; they must not silently win
+    # over an origin-bound short lease that can be audited independently.
+    token = _lease_github_token(purpose=purpose, target=target)
     if token:
         return token
-    token = _lease_github_token()
+    token = _secret_reference("GITHUB_TOKEN_REF", _GITHUB_TOKEN_REF, "github_token")
     if token:
         return token
     proc = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
@@ -73,10 +78,18 @@ def _token() -> str:
     return proc.stdout.strip()
 
 
-def _api(method: str, path: str, body: Any = None, query: dict[str, Any] | None = None) -> tuple[int, Any]:
+def _api(
+    method: str,
+    path: str,
+    body: Any = None,
+    query: dict[str, Any] | None = None,
+    *,
+    purpose: str = "github.api",
+    target: str = "provider:github",
+) -> tuple[int, Any]:
     if not path.startswith("/") or ".." in path or "?" in path:
         raise RuntimeError("github_api_path_invalid")
-    token = _token()
+    token = _token(purpose=purpose, target=target)
     request = urllib.request.Request(
         f"https://api.github.com{path}" + ("?" + urllib.parse.urlencode(query) if query else ""), method=method,
         data=None if body is None else json.dumps(body).encode("utf-8"),
@@ -114,13 +127,19 @@ def _git(args: list[str], timeout: float = 300.0) -> subprocess.CompletedProcess
     return subprocess.run(["git", *args], capture_output=True, text=True, timeout=timeout)
 
 
-def _lease_github_token() -> str:
+def _lease_github_token(*, purpose: str = "github.api", target: str = "provider:github") -> str:
     vault_url = os.environ.get("URIRUN_VAULT_URL", "").rstrip("/")
     vault_token = _secret_reference("URIRUN_VAULT_TOKEN_REF", _VAULT_TOKEN_REF, "github_vault_token")
     entry_id = os.environ.get("GITHUB_VAULT_ENTRY_ID", "github-cli-runtime")
     if not vault_url or not vault_token:
         return ""
-    body = json.dumps({"origin": "https://github.com", "field": "api_key"}).encode("utf-8")
+    body = json.dumps({
+        "origin": "https://github.com",
+        "field": "api_key",
+        "actor": "connector:github",
+        "purpose": purpose,
+        "target": target,
+    }).encode("utf-8")
     request = urllib.request.Request(
         f"{vault_url}/internal/vault/{urllib.parse.quote(entry_id, safe='')}/lease",
         data=body,
@@ -164,6 +183,29 @@ def _github_identity(token: str, api_url: str = "https://api.github.com") -> dic
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as error:
         raise RuntimeError("github_token_validation_failed") from error
     return {"login": str(data.get("login") or ""), "scopes": scopes}
+
+
+def _validate_bootstrap_scopes(scopes: list[str]) -> list[str]:
+    """Reject a gh bootstrap token whose effective classic scopes exceed policy.
+
+    GitHub does not expose fine-grained token permissions through the legacy
+    ``X-OAuth-Scopes`` header. An empty list is therefore unverifiable here and
+    remains fail-closed; production execution should use a repository-scoped
+    GitHub App installation token instead.
+    """
+    observed = sorted(set(scopes))
+    if not observed or any(not _SAFE_SCOPE.fullmatch(scope) for scope in observed):
+        raise RuntimeError("github_token_scopes_unverifiable")
+    configured = os.environ.get(
+        "GITHUB_BOOTSTRAP_ALLOWED_SCOPES",
+        ",".join(sorted(_DEFAULT_BOOTSTRAP_ALLOWED_SCOPES)),
+    )
+    allowed = {item.strip() for item in configured.split(",") if item.strip()}
+    if not allowed or any(not _SAFE_SCOPE.fullmatch(scope) for scope in allowed):
+        raise RuntimeError("github_bootstrap_scope_policy_invalid")
+    if set(observed) - allowed:
+        raise RuntimeError("github_token_scope_excessive")
+    return observed
 
 
 def _store_token_in_vault(*, vault_url: str, vault_token: str, entry_id: str, origin: str, token: str) -> str:
@@ -300,6 +342,127 @@ def _pages(path: str, query: dict[str, Any], max_items: int) -> tuple[list[Any],
     return rows[:max_items], False, requests
 
 
+def _issue_row(owner: str, repo: str, row: dict[str, Any]) -> dict[str, Any]:
+    """Project one GitHub issue into a bounded, secret-free task observation."""
+    labels = [
+        str(item.get("name") or "")[:100]
+        for item in (row.get("labels") or [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+    assignees = [
+        str(item.get("login") or "")[:100]
+        for item in (row.get("assignees") or [])
+        if isinstance(item, dict) and str(item.get("login") or "").strip()
+    ]
+    milestone = row.get("milestone") if isinstance(row.get("milestone"), dict) else {}
+    user = row.get("user") if isinstance(row.get("user"), dict) else {}
+    return {
+        "provider": "github",
+        "repository": f"{owner}/{repo}",
+        "number": int(row.get("number") or 0),
+        "node_id": str(row.get("node_id") or "")[:160],
+        "title": str(row.get("title") or "")[:256],
+        "body": str(row.get("body") or "")[:12000],
+        "state": str(row.get("state") or ""),
+        "state_reason": str(row.get("state_reason") or ""),
+        "url": str(row.get("html_url") or "")[:1000],
+        "author": str(user.get("login") or "")[:100],
+        "author_association": str(row.get("author_association") or "").upper()[:40],
+        "labels": labels[:100],
+        "assignees": assignees[:100],
+        "milestone": str(milestone.get("title") or "")[:256],
+        "locked": bool(row.get("locked")),
+        "comments": max(0, int(row.get("comments") or 0)),
+        "created_at": str(row.get("created_at") or ""),
+        "updated_at": str(row.get("updated_at") or ""),
+        "closed_at": str(row.get("closed_at") or ""),
+    }
+
+
+@conn.handler("issue/query/list", isolated=True, meta={"label": "List bounded GitHub issues"})
+def list_issues(
+    owner: str = "",
+    repo: str = "",
+    state: str = "open",
+    labels: list[str] | None = None,
+    since: str = "",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """List issues for deterministic task ingestion.
+
+    Pull requests are excluded even though GitHub exposes them through the same
+    endpoint. Pagination and response fields are bounded so issue content can be
+    admitted by a separate policy compiler without granting this query route any
+    mutation authority.
+    """
+    if state not in {"open", "closed", "all"}:
+        return urirun.fail("github_issue_state_invalid", mutation_attempted=False)
+    if isinstance(limit, bool) or not 1 <= int(limit) <= 500:
+        return urirun.fail("github_issue_limit_invalid", mutation_attempted=False)
+    clean_labels = [str(item).strip()[:100] for item in (labels or []) if str(item).strip()]
+    if len(clean_labels) > 20:
+        return urirun.fail("github_issue_labels_invalid", mutation_attempted=False)
+    if since and not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", since):
+        return urirun.fail("github_issue_since_invalid", mutation_attempted=False)
+    try:
+        path = _repo_path(owner, repo, "/issues")
+    except RuntimeError as error:
+        return urirun.fail(str(error), mutation_attempted=False)
+
+    rows: list[dict[str, Any]] = []
+    page = 1
+    requests = 0
+    complete = False
+    try:
+        while len(rows) < int(limit) and requests < 10:
+            page_size = 100
+            query: dict[str, Any] = {
+                "state": state,
+                "sort": "updated",
+                "direction": "desc",
+                "page": page,
+                "per_page": page_size,
+            }
+            if clean_labels:
+                query["labels"] = ",".join(clean_labels)
+            if since:
+                query["since"] = since
+            status, payload = _api(
+                "GET",
+                path,
+                query=query,
+                purpose="github.issue.query",
+                target="provider:github",
+            )
+            requests += 1
+            if status != 200 or not isinstance(payload, list):
+                raise RuntimeError(f"github_issue_query_failed:{status}")
+            for item in payload:
+                if not isinstance(item, dict) or "pull_request" in item:
+                    continue
+                projected = _issue_row(owner, repo, item)
+                if projected["number"] > 0:
+                    rows.append(projected)
+                    if len(rows) >= int(limit):
+                        break
+            if len(payload) < page_size:
+                complete = True
+                break
+            page += 1
+    except RuntimeError as error:
+        return urirun.fail(str(error), owner=owner, repo=repo, mutation_attempted=False)
+    return urirun.ok(
+        owner=owner,
+        repo=repo,
+        state=state,
+        issues=rows[:int(limit)],
+        count=len(rows[:int(limit)]),
+        complete=complete,
+        requests=requests,
+        mutation_attempted=False,
+    )
+
+
 @conn.handler("account/query/twin", isolated=True, meta={"label": "Map visible GitHub account resources"})
 def account_query_twin(max_items: int = 1000, instance_id: str = "github.com") -> dict[str, Any]:
     try:
@@ -367,6 +530,7 @@ def import_gh_token_to_vault(
         return urirun.fail("github_cli_token_unavailable")
     try:
         identity = _github_identity(token, api_url)
+        identity["scopes"] = _validate_bootstrap_scopes(identity["scopes"])
         stored_id = _store_token_in_vault(
             vault_url=vault_url or os.environ.get("URIRUN_VAULT_URL", ""),
             vault_token=_secret_reference(
