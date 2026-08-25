@@ -103,10 +103,33 @@ def test_github_token_resolves_only_a_reference(monkeypatch):
         raise AssertionError("literal token reference must be rejected")
 
 
+def test_api_token_prefers_auditable_vault_lease(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        core,
+        "_lease_github_token",
+        lambda **context: calls.append(("vault", context)) or "leased-token",
+    )
+    monkeypatch.setattr(
+        core,
+        "_secret_reference",
+        lambda *args, **kwargs: calls.append(("env", {})) or "environment-token",
+    )
+
+    assert core._token(purpose="github.issue.query", target="provider:github") == "leased-token"
+    assert calls == [("vault", {"purpose": "github.issue.query", "target": "provider:github"})]
+
+
+def test_api_token_uses_declared_environment_reference_only_without_vault(monkeypatch):
+    monkeypatch.setattr(core, "_lease_github_token", lambda **context: "")
+    monkeypatch.setattr(core, "_secret_reference", lambda *args, **kwargs: "environment-token")
+    assert core._token() == "environment-token"
+
+
 def test_gh_uses_short_vault_lease_without_exposing_token(monkeypatch):
     calls = {}
     monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.setattr(core, "_lease_github_token", lambda: "short-lived-secret")
+    monkeypatch.setattr(core, "_lease_github_token", lambda **context: "short-lived-secret")
 
     def fake_run(command, **kwargs):
         calls.update(command=command, env=kwargs["env"])
@@ -170,8 +193,8 @@ def test_api_operations_are_structured_and_least_privilege(monkeypatch):
 def test_issue_query_is_bounded_excludes_pull_requests_and_preserves_admission_metadata(monkeypatch):
     calls = []
 
-    def fake_api(method, path, body=None, query=None):
-        calls.append((method, path, query))
+    def fake_api(method, path, body=None, query=None, **context):
+        calls.append((method, path, query, context))
         return 200, [
             {
                 "number": 7,
@@ -203,7 +226,7 @@ def test_issue_query_is_bounded_excludes_pull_requests_and_preserves_admission_m
     assert calls == [("GET", "/repos/subactor/core/issues", {
         "state": "open", "sort": "updated", "direction": "desc",
         "page": 1, "per_page": 100, "labels": "subactor:autonomy",
-    })]
+    }, {"purpose": "github.issue.query", "target": "provider:github"})]
 
 
 def test_issue_query_rejects_unbounded_or_ambiguous_input(monkeypatch):

@@ -60,11 +60,14 @@ def _secret_reference(env_name: str, default_reference: str, error_prefix: str) 
         raise RuntimeError(f"{error_prefix}_ref_denied") from error
 
 
-def _token() -> str:
-    token = _secret_reference("GITHUB_TOKEN_REF", _GITHUB_TOKEN_REF, "github_token")
+def _token(*, purpose: str = "github.api", target: str = "provider:github") -> str:
+    # A configured Vault is the normal execution boundary. Environment and the
+    # local gh profile are bootstrap fallbacks only; they must not silently win
+    # over an origin-bound short lease that can be audited independently.
+    token = _lease_github_token(purpose=purpose, target=target)
     if token:
         return token
-    token = _lease_github_token()
+    token = _secret_reference("GITHUB_TOKEN_REF", _GITHUB_TOKEN_REF, "github_token")
     if token:
         return token
     proc = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
@@ -73,10 +76,18 @@ def _token() -> str:
     return proc.stdout.strip()
 
 
-def _api(method: str, path: str, body: Any = None, query: dict[str, Any] | None = None) -> tuple[int, Any]:
+def _api(
+    method: str,
+    path: str,
+    body: Any = None,
+    query: dict[str, Any] | None = None,
+    *,
+    purpose: str = "github.api",
+    target: str = "provider:github",
+) -> tuple[int, Any]:
     if not path.startswith("/") or ".." in path or "?" in path:
         raise RuntimeError("github_api_path_invalid")
-    token = _token()
+    token = _token(purpose=purpose, target=target)
     request = urllib.request.Request(
         f"https://api.github.com{path}" + ("?" + urllib.parse.urlencode(query) if query else ""), method=method,
         data=None if body is None else json.dumps(body).encode("utf-8"),
@@ -114,13 +125,19 @@ def _git(args: list[str], timeout: float = 300.0) -> subprocess.CompletedProcess
     return subprocess.run(["git", *args], capture_output=True, text=True, timeout=timeout)
 
 
-def _lease_github_token() -> str:
+def _lease_github_token(*, purpose: str = "github.api", target: str = "provider:github") -> str:
     vault_url = os.environ.get("URIRUN_VAULT_URL", "").rstrip("/")
     vault_token = _secret_reference("URIRUN_VAULT_TOKEN_REF", _VAULT_TOKEN_REF, "github_vault_token")
     entry_id = os.environ.get("GITHUB_VAULT_ENTRY_ID", "github-cli-runtime")
     if not vault_url or not vault_token:
         return ""
-    body = json.dumps({"origin": "https://github.com", "field": "api_key"}).encode("utf-8")
+    body = json.dumps({
+        "origin": "https://github.com",
+        "field": "api_key",
+        "actor": "connector:github",
+        "purpose": purpose,
+        "target": target,
+    }).encode("utf-8")
     request = urllib.request.Request(
         f"{vault_url}/internal/vault/{urllib.parse.quote(entry_id, safe='')}/lease",
         data=body,
@@ -385,7 +402,13 @@ def list_issues(
                 query["labels"] = ",".join(clean_labels)
             if since:
                 query["since"] = since
-            status, payload = _api("GET", path, query=query)
+            status, payload = _api(
+                "GET",
+                path,
+                query=query,
+                purpose="github.issue.query",
+                target="provider:github",
+            )
             requests += 1
             if status != 200 or not isinstance(payload, list):
                 raise RuntimeError(f"github_issue_query_failed:{status}")
