@@ -25,8 +25,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +47,40 @@ _SAFE_SCOPE = re.compile(r"^[a-z][a-z0-9:_-]{0,63}$")
 _GITHUB_TOKEN_REF = "getv://GITHUB_TOKEN"
 _VAULT_TOKEN_REF = "getv://URIRUN_VAULT_TOKEN"
 _DEFAULT_BOOTSTRAP_ALLOWED_SCOPES = frozenset({"repo", "read:org", "workflow"})
+_INITIAL_REF_SCHEMA = "subactor.repository-initial-ref-validation-dispatch/v1"
+_VALIDATOR_REPOSITORY = "subactor/validator-agent"
+_VALIDATOR_WORKFLOW = "validator.yml"
+_VALIDATOR_WORKFLOW_PATH = ".github/workflows/validator.yml"
+_VALIDATOR_WORKFLOW_REF = "main"
+_VALIDATOR_ARTIFACT = "validator-agent-result"
+_VALIDATOR_RECEIPT = "validator-initial-ref-receipt.json"
+_INITIAL_REF_PURPOSE = "github.validator.initial-ref"
+_INITIAL_REF_TARGET = "repository:subactor--validator-agent"
+_SHA = re.compile(r"^[a-f0-9]{40}$")
+_SHA256 = re.compile(r"^[a-f0-9]{64}$")
+_REPOSITORY = re.compile(
+    r"^[a-z0-9](?:[a-z0-9_.-]{0,94}[a-z0-9])?/"
+    r"[a-z0-9](?:[a-z0-9_.-]{0,94}[a-z0-9])?$"
+)
+_CORRELATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_INITIAL_REF_REQUEST_KEYS = frozenset({
+    "schema", "handoffId", "repository", "repositoryOwner", "repositoryName",
+    "validatorRepository", "workflow", "workflowPath", "workflowRef",
+    "displayTitle", "expectedPlanDigest", "expectedPublicationReceiptDigest",
+    "expectedHeadSha", "correlationId", "inputs",
+})
+_INITIAL_REF_INPUT_KEYS = frozenset({
+    "strategy", "repository_owner", "repository_name", "expected_head_sha",
+    "expected_plan_digest", "expected_publication_receipt_digest",
+    "initial_ref_plan_b64", "initial_ref_grant_b64",
+    "initial_ref_publication_receipt_b64", "correlation_id",
+    "execution_profile", "force",
+})
+_INITIAL_REF_RUN_STATUSES = frozenset({
+    "queued", "in_progress", "completed", "waiting", "pending", "requested",
+})
+_MAX_INITIAL_REF_REQUEST_BYTES = 64 * 1024
+_MAX_INITIAL_REF_RECEIPT_BYTES = 64 * 1024
 
 
 def _secret_reference(env_name: str, default_reference: str, error_prefix: str) -> str:
@@ -157,18 +193,150 @@ def _lease_github_token(*, purpose: str = "github.api", target: str = "provider:
     return token
 
 
-def _gh(args: list[str], timeout: float = 120.0, *, use_vault: bool = True) -> subprocess.CompletedProcess:
+def _gh(
+    args: list[str],
+    timeout: float = 120.0,
+    *,
+    use_vault: bool = True,
+    purpose: str = "github.api",
+    target: str = "provider:github",
+) -> subprocess.CompletedProcess:
     token = ""
     try:
-        token = _lease_github_token() if use_vault else ""
+        token = _lease_github_token(purpose=purpose, target=target) if use_vault else ""
         env = dict(os.environ)
         if token:
             env["GH_TOKEN"] = token
         return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout, env=env)
-    except RuntimeError:
-        return subprocess.CompletedProcess(["gh", *args], 1, "", "github_vault_lease_failed")
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess(["gh", *args], 1, "", "github_command_unavailable")
     finally:
         token = ""
+
+
+def _exact_object(value: Any, keys: frozenset[str]) -> bool:
+    return type(value) is dict and set(value) == keys
+
+
+def _validate_initial_ref_request(request: dict[str, Any]) -> dict[str, Any]:
+    if not _exact_object(request, _INITIAL_REF_REQUEST_KEYS):
+        raise RuntimeError("initial_ref_request_invalid")
+    inputs = request.get("inputs")
+    repository = request.get("repository")
+    if (
+        request.get("schema") != _INITIAL_REF_SCHEMA
+        or not _SHA256.fullmatch(str(request.get("handoffId") or ""))
+        or not _REPOSITORY.fullmatch(str(repository or ""))
+        or repository != f"{request.get('repositoryOwner')}/{request.get('repositoryName')}"
+        or request.get("validatorRepository") != _VALIDATOR_REPOSITORY
+        or request.get("workflow") != _VALIDATOR_WORKFLOW
+        or request.get("workflowPath") != _VALIDATOR_WORKFLOW_PATH
+        or request.get("workflowRef") != _VALIDATOR_WORKFLOW_REF
+        or not isinstance(request.get("displayTitle"), str)
+        or not 1 <= len(request["displayTitle"]) <= 512
+        or not _SHA256.fullmatch(str(request.get("expectedPlanDigest") or ""))
+        or not _SHA256.fullmatch(str(request.get("expectedPublicationReceiptDigest") or ""))
+        or not _SHA.fullmatch(str(request.get("expectedHeadSha") or ""))
+        or not _CORRELATION.fullmatch(str(request.get("correlationId") or ""))
+        or not _exact_object(inputs, _INITIAL_REF_INPUT_KEYS)
+        or inputs.get("strategy") != "repository-initial-ref"
+        or inputs.get("repository_owner") != request.get("repositoryOwner")
+        or inputs.get("repository_name") != request.get("repositoryName")
+        or inputs.get("expected_head_sha") != request.get("expectedHeadSha")
+        or inputs.get("expected_plan_digest") != request.get("expectedPlanDigest")
+        or inputs.get("expected_publication_receipt_digest")
+            != request.get("expectedPublicationReceiptDigest")
+        or inputs.get("correlation_id") != request.get("correlationId")
+        or inputs.get("execution_profile") != "production"
+        or inputs.get("force") is not True
+        or any(
+            not isinstance(inputs.get(key), str) or not inputs[key]
+            for key in (
+                "initial_ref_plan_b64", "initial_ref_grant_b64",
+                "initial_ref_publication_receipt_b64",
+            )
+        )
+    ):
+        raise RuntimeError("initial_ref_request_invalid")
+    try:
+        request_size = len(json.dumps(request, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("initial_ref_request_invalid") from error
+    if request_size > _MAX_INITIAL_REF_REQUEST_BYTES:
+        raise RuntimeError("initial_ref_request_invalid")
+    return request
+
+
+def _initial_ref_api(method: str, path: str, *, query: dict[str, Any] | None = None) -> tuple[int, Any]:
+    return _api(
+        method,
+        path,
+        query=query,
+        purpose=_INITIAL_REF_PURPOSE,
+        target=_INITIAL_REF_TARGET,
+    )
+
+
+def _initial_ref_workflow_sha() -> str:
+    status, payload = _initial_ref_api(
+        "GET", f"/repos/{_VALIDATOR_REPOSITORY}/commits/{_VALIDATOR_WORKFLOW_REF}"
+    )
+    workflow_sha = str(payload.get("sha") or "") if isinstance(payload, dict) else ""
+    if status != 200 or not _SHA.fullmatch(workflow_sha):
+        raise RuntimeError("initial_ref_workflow_ref_unavailable")
+    return workflow_sha
+
+
+def _initial_ref_run_matches(run: Any, request: dict[str, Any], workflow_sha: str) -> bool:
+    return (
+        isinstance(run, dict)
+        and isinstance(run.get("id"), int)
+        and not isinstance(run.get("id"), bool)
+        and run["id"] > 0
+        and run.get("display_title") == request["displayTitle"]
+        and run.get("event") == "workflow_dispatch"
+        and run.get("head_branch") == _VALIDATOR_WORKFLOW_REF
+        and run.get("head_sha") == workflow_sha
+        and run.get("path") == _VALIDATOR_WORKFLOW_PATH
+        and run.get("status") in _INITIAL_REF_RUN_STATUSES
+    )
+
+
+def _initial_ref_runs(request: dict[str, Any], workflow_sha: str) -> list[dict[str, Any]]:
+    status, payload = _initial_ref_api(
+        "GET",
+        f"/repos/{_VALIDATOR_REPOSITORY}/actions/workflows/{_VALIDATOR_WORKFLOW}/runs",
+        query={
+            "branch": _VALIDATOR_WORKFLOW_REF,
+            "event": "workflow_dispatch",
+            "per_page": 100,
+        },
+    )
+    rows = payload.get("workflow_runs") if isinstance(payload, dict) else None
+    if status != 200 or not isinstance(rows, list) or len(rows) > 100:
+        raise RuntimeError("initial_ref_run_query_failed")
+    matches = [row for row in rows if _initial_ref_run_matches(row, request, workflow_sha)]
+    if len(matches) > 1:
+        raise RuntimeError("initial_ref_run_ambiguous")
+    return matches
+
+
+def _initial_ref_run(request: dict[str, Any], workflow_sha: str, run_id: int) -> dict[str, Any]:
+    status, payload = _initial_ref_api(
+        "GET", f"/repos/{_VALIDATOR_REPOSITORY}/actions/runs/{run_id}"
+    )
+    if status != 200 or not _initial_ref_run_matches(payload, request, workflow_sha):
+        raise RuntimeError("initial_ref_run_untrusted")
+    return payload
+
+
+def _initial_ref_gh(args: list[str], *, timeout: float) -> subprocess.CompletedProcess:
+    return _gh(
+        args,
+        timeout=timeout,
+        purpose=_INITIAL_REF_PURPOSE,
+        target=_INITIAL_REF_TARGET,
+    )
 
 
 def _github_identity(token: str, api_url: str = "https://api.github.com") -> dict[str, Any]:
@@ -640,6 +808,133 @@ def assign_issue(owner: str = "", repo: str = "", number: int = 0, assignees: li
     return urirun.ok(owner=owner, repo=repo, number=int(number), assignees=clean, url=data.get("html_url"))
 
 
+@conn.handler(
+    "validator/initial-ref/command/dispatch",
+    isolated=True,
+    meta={"label": "Dispatch the exact repository initial-ref Validator workflow"},
+)
+def dispatch_initial_ref_validation(request: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Dispatch one fixed protected Validator workflow with exact input binding."""
+    try:
+        bound = _validate_initial_ref_request(request or {})
+        workflow_sha = _initial_ref_workflow_sha()
+        matches = _initial_ref_runs(bound, workflow_sha)
+        if matches:
+            return urirun.ok(status="deduplicated", workflowSha=workflow_sha, run=matches[0])
+        args = [
+            "workflow", "run", _VALIDATOR_WORKFLOW,
+            "--repo", _VALIDATOR_REPOSITORY,
+            "--ref", _VALIDATOR_WORKFLOW_REF,
+        ]
+        for key in sorted(bound["inputs"]):
+            value = bound["inputs"][key]
+            args.extend(["-f", f"{key}={'true' if value is True else value}"])
+        proc = _initial_ref_gh(args, timeout=120)
+        if proc.returncode != 0:
+            raise RuntimeError("initial_ref_dispatch_failed")
+        return urirun.ok(status="dispatched", workflowSha=workflow_sha, run=None)
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+
+
+@conn.handler(
+    "validator/initial-ref/query/run",
+    isolated=True,
+    meta={"label": "Observe the exact repository initial-ref Validator run"},
+)
+def observe_initial_ref_validation(
+    request: dict[str, Any] | None = None,
+    workflowSha: str = "",
+) -> dict[str, Any]:
+    """Return at most one run bound to the request and persisted workflow SHA."""
+    try:
+        bound = _validate_initial_ref_request(request or {})
+        if not _SHA.fullmatch(workflowSha):
+            raise RuntimeError("initial_ref_workflow_sha_invalid")
+        matches = _initial_ref_runs(bound, workflowSha)
+        return urirun.ok(run=matches[0] if matches else None)
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+
+
+@conn.handler(
+    "validator/initial-ref/query/receipt",
+    isolated=True,
+    meta={"label": "Load attested repository initial-ref Validator evidence"},
+)
+def load_initial_ref_validation_receipt(
+    request: dict[str, Any] | None = None,
+    runId: int = 0,
+    workflowSha: str = "",
+) -> dict[str, Any]:
+    """Download and verify one fixed receipt from one exactly bound workflow run."""
+    try:
+        bound = _validate_initial_ref_request(request or {})
+        if isinstance(runId, bool) or int(runId or 0) < 1 or not _SHA.fullmatch(workflowSha):
+            raise RuntimeError("initial_ref_receipt_binding_invalid")
+        run = _initial_ref_run(bound, workflowSha, int(runId))
+        if run.get("status") != "completed":
+            raise RuntimeError("initial_ref_run_not_terminal")
+        with tempfile.TemporaryDirectory(prefix="urirun-github-initial-ref-") as temp_dir:
+            download = _initial_ref_gh([
+                "run", "download", str(int(runId)),
+                "--repo", _VALIDATOR_REPOSITORY,
+                "--name", _VALIDATOR_ARTIFACT,
+                "--dir", temp_dir,
+            ], timeout=120)
+            if download.returncode != 0:
+                raise RuntimeError("initial_ref_receipt_download_failed")
+            receipt_path = Path(temp_dir) / _VALIDATOR_RECEIPT
+            try:
+                receipt_stat = receipt_path.lstat()
+            except OSError as error:
+                raise RuntimeError("initial_ref_receipt_missing") from error
+            if (
+                not stat.S_ISREG(receipt_stat.st_mode)
+                or receipt_stat.st_size < 2
+                or receipt_stat.st_size > _MAX_INITIAL_REF_RECEIPT_BYTES
+            ):
+                raise RuntimeError("initial_ref_receipt_invalid")
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise RuntimeError("initial_ref_receipt_invalid") from error
+            if not isinstance(receipt, dict):
+                raise RuntimeError("initial_ref_receipt_invalid")
+            attestation = _initial_ref_gh([
+                "attestation", "verify", str(receipt_path),
+                "--repo", _VALIDATOR_REPOSITORY,
+                "--signer-workflow", f"{_VALIDATOR_REPOSITORY}/{_VALIDATOR_WORKFLOW_PATH}",
+                "--source-ref", f"refs/heads/{_VALIDATOR_WORKFLOW_REF}",
+                "--source-digest", workflowSha,
+                "--deny-self-hosted-runners",
+                "--format", "json",
+            ], timeout=120)
+            if attestation.returncode != 0:
+                raise RuntimeError("initial_ref_attestation_invalid")
+            try:
+                statements = json.loads(attestation.stdout)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise RuntimeError("initial_ref_attestation_invalid") from error
+            if not isinstance(statements, list) or not statements:
+                raise RuntimeError("initial_ref_attestation_invalid")
+            return urirun.ok(
+                receipt=receipt,
+                attestation={
+                    "verified": True,
+                    "repository": _VALIDATOR_REPOSITORY,
+                    "signerWorkflow": f"{_VALIDATOR_REPOSITORY}/{_VALIDATOR_WORKFLOW_PATH}",
+                    "sourceRef": f"refs/heads/{_VALIDATOR_WORKFLOW_REF}",
+                    "sourceDigest": workflowSha,
+                    "statementCount": len(statements),
+                },
+            )
+    except (TypeError, ValueError):
+        return urirun.fail("initial_ref_receipt_binding_invalid")
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+
+
 # --- authoring surface -----------------------------------------------------
 
 def urirun_bindings() -> dict[str, Any]:
@@ -662,7 +957,7 @@ def _connector_version() -> str:
 
         return version("urirun-connector-github")
     except Exception:
-        return "0.3.0"
+        return "0.4.0"
 
 
 def connector_manifest() -> dict[str, Any]:

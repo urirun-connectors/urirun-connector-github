@@ -150,6 +150,33 @@
       "out": {"owner": "str", "repo": "str", "number": "int", "assignees": "list", "url": "?str"},
       "errors": ["precondition-unmet", "degraded-backend"],
       "examples": [{"payload": {"owner": "example-org", "repo": "education-sandbox", "number": 1, "assignees": ["intern"]}, "result": {"ok": true, "owner": "example-org", "repo": "education-sandbox", "number": 1, "assignees": ["intern"], "url": "https://github.com/example-org/education-sandbox/issues/1"}}]
+    },
+    "validator/initial-ref/command/dispatch": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {"request": "obj"},
+      "out": {"status": "enum:dispatched|deduplicated", "workflowSha": "str", "run": "any"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"request": {}}, "result": {"ok": true, "status": "dispatched", "workflowSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "run": null}}]
+    },
+    "validator/initial-ref/query/run": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"request": "obj", "workflowSha": "str"},
+      "out": {"run": "any"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"request": {}, "workflowSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "result": {"ok": true, "run": null}}]
+    },
+    "validator/initial-ref/query/receipt": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"request": "obj", "runId": "int", "workflowSha": "str"},
+      "out": {"receipt": "obj", "attestation": "obj"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"request": {}, "runId": 32900000001, "workflowSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "result": {"ok": true, "receipt": {}, "attestation": {}}}]
     }
   },
   "wires": []
