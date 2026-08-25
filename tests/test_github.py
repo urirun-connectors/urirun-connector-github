@@ -10,7 +10,7 @@ import urirun
 from urirun_connector_github import (
     account_query_twin, assign_issue, auth_status, clone, connector_manifest, create_issue,
     create_repo, import_gh_token_to_vault, install, invite_collaborator,
-    list_repos, pull, repo_bindings, urirun_bindings,
+    list_issues, list_repos, pull, repo_bindings, urirun_bindings,
 )
 import urirun_connector_github.core as core
 
@@ -21,7 +21,8 @@ ROUTES = {
     "github://host/auth/query/status", "github://host/auth/command/import-to-vault",
     "github://host/account/query/twin",
     "github://host/repo/collaborator/command/invite", "github://host/issue/command/create",
-    "github://host/issue/command/assign", "github://host/doctor/query/report",
+    "github://host/issue/command/assign", "github://host/issue/query/list",
+    "github://host/doctor/query/report",
 }
 
 
@@ -164,6 +165,52 @@ def test_api_operations_are_structured_and_least_privilege(monkeypatch):
     assert create_issue(owner="org",repo="sandbox",title="First task",labels=["education"])["number"]==3
     assert assign_issue(owner="org",repo="sandbox",number=3,assignees=["intern"])["ok"]
     assert calls[1][2]["permission"]=="triage"
+
+
+def test_issue_query_is_bounded_excludes_pull_requests_and_preserves_admission_metadata(monkeypatch):
+    calls = []
+
+    def fake_api(method, path, body=None, query=None):
+        calls.append((method, path, query))
+        return 200, [
+            {
+                "number": 7,
+                "node_id": "I_fixture",
+                "title": "Implement bounded ingestion",
+                "body": "No credentials here",
+                "state": "open",
+                "html_url": "https://github.com/subactor/core/issues/7",
+                "user": {"login": "maintainer"},
+                "author_association": "MEMBER",
+                "labels": [{"name": "subactor:autonomy"}],
+                "assignees": [{"login": "automation-bot"}],
+                "created_at": "2026-08-25T10:00:00Z",
+                "updated_at": "2026-08-25T11:00:00Z",
+            },
+            {
+                "number": 8,
+                "title": "A pull request",
+                "pull_request": {"url": "https://api.github.com/pulls/8"},
+            },
+        ]
+
+    monkeypatch.setattr(core, "_api", fake_api)
+    result = list_issues(owner="subactor", repo="core", labels=["subactor:autonomy"], limit=10)
+    assert result["ok"] and result["count"] == 1 and result["complete"] is True
+    assert result["mutation_attempted"] is False
+    assert result["issues"][0]["author_association"] == "MEMBER"
+    assert result["issues"][0]["labels"] == ["subactor:autonomy"]
+    assert calls == [("GET", "/repos/subactor/core/issues", {
+        "state": "open", "sort": "updated", "direction": "desc",
+        "page": 1, "per_page": 100, "labels": "subactor:autonomy",
+    })]
+
+
+def test_issue_query_rejects_unbounded_or_ambiguous_input(monkeypatch):
+    monkeypatch.setattr(core, "_api", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not call API")))
+    assert list_issues(owner="subactor", repo="core", limit=501)["ok"] is False
+    assert list_issues(owner="subactor", repo="core", state="pending")["ok"] is False
+    assert list_issues(owner="subactor", repo="core", since="yesterday")["ok"] is False
 
 
 def test_collaborator_rejects_admin_permission():

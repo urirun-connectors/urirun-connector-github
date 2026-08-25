@@ -124,6 +124,15 @@
       "errors": ["precondition-unmet", "degraded-backend"],
       "examples": [{"payload": {"owner": "example-org", "repo": "education-sandbox", "title": "First educational task"}, "result": {"ok": true, "owner": "example-org", "repo": "education-sandbox", "number": 1, "url": "https://github.com/example-org/education-sandbox/issues/1", "created": true}}]
     },
+    "issue/query/list": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"owner": "str", "repo": "str", "state": "?str", "labels": "?list", "since": "?str", "limit": "?int"},
+      "out": {"owner": "str", "repo": "str", "state": "str", "issues": "list", "count": "int", "complete": "bool", "requests": "int", "mutation_attempted": "bool"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"owner": "subactor", "repo": "core", "state": "open", "limit": 100}, "result": {"ok": true, "owner": "subactor", "repo": "core", "state": "open", "issues": [], "count": 0, "complete": true, "requests": 1, "mutation_attempted": false}}]
+    },
     "account/query/twin": {
       "version": "v1",
       "effect": "query",

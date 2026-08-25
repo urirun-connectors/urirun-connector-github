@@ -300,6 +300,121 @@ def _pages(path: str, query: dict[str, Any], max_items: int) -> tuple[list[Any],
     return rows[:max_items], False, requests
 
 
+def _issue_row(owner: str, repo: str, row: dict[str, Any]) -> dict[str, Any]:
+    """Project one GitHub issue into a bounded, secret-free task observation."""
+    labels = [
+        str(item.get("name") or "")[:100]
+        for item in (row.get("labels") or [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+    assignees = [
+        str(item.get("login") or "")[:100]
+        for item in (row.get("assignees") or [])
+        if isinstance(item, dict) and str(item.get("login") or "").strip()
+    ]
+    milestone = row.get("milestone") if isinstance(row.get("milestone"), dict) else {}
+    user = row.get("user") if isinstance(row.get("user"), dict) else {}
+    return {
+        "provider": "github",
+        "repository": f"{owner}/{repo}",
+        "number": int(row.get("number") or 0),
+        "node_id": str(row.get("node_id") or "")[:160],
+        "title": str(row.get("title") or "")[:256],
+        "body": str(row.get("body") or "")[:12000],
+        "state": str(row.get("state") or ""),
+        "state_reason": str(row.get("state_reason") or ""),
+        "url": str(row.get("html_url") or "")[:1000],
+        "author": str(user.get("login") or "")[:100],
+        "author_association": str(row.get("author_association") or "").upper()[:40],
+        "labels": labels[:100],
+        "assignees": assignees[:100],
+        "milestone": str(milestone.get("title") or "")[:256],
+        "locked": bool(row.get("locked")),
+        "comments": max(0, int(row.get("comments") or 0)),
+        "created_at": str(row.get("created_at") or ""),
+        "updated_at": str(row.get("updated_at") or ""),
+        "closed_at": str(row.get("closed_at") or ""),
+    }
+
+
+@conn.handler("issue/query/list", isolated=True, meta={"label": "List bounded GitHub issues"})
+def list_issues(
+    owner: str = "",
+    repo: str = "",
+    state: str = "open",
+    labels: list[str] | None = None,
+    since: str = "",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """List issues for deterministic task ingestion.
+
+    Pull requests are excluded even though GitHub exposes them through the same
+    endpoint. Pagination and response fields are bounded so issue content can be
+    admitted by a separate policy compiler without granting this query route any
+    mutation authority.
+    """
+    if state not in {"open", "closed", "all"}:
+        return urirun.fail("github_issue_state_invalid", mutation_attempted=False)
+    if isinstance(limit, bool) or not 1 <= int(limit) <= 500:
+        return urirun.fail("github_issue_limit_invalid", mutation_attempted=False)
+    clean_labels = [str(item).strip()[:100] for item in (labels or []) if str(item).strip()]
+    if len(clean_labels) > 20:
+        return urirun.fail("github_issue_labels_invalid", mutation_attempted=False)
+    if since and not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", since):
+        return urirun.fail("github_issue_since_invalid", mutation_attempted=False)
+    try:
+        path = _repo_path(owner, repo, "/issues")
+    except RuntimeError as error:
+        return urirun.fail(str(error), mutation_attempted=False)
+
+    rows: list[dict[str, Any]] = []
+    page = 1
+    requests = 0
+    complete = False
+    try:
+        while len(rows) < int(limit) and requests < 10:
+            page_size = 100
+            query: dict[str, Any] = {
+                "state": state,
+                "sort": "updated",
+                "direction": "desc",
+                "page": page,
+                "per_page": page_size,
+            }
+            if clean_labels:
+                query["labels"] = ",".join(clean_labels)
+            if since:
+                query["since"] = since
+            status, payload = _api("GET", path, query=query)
+            requests += 1
+            if status != 200 or not isinstance(payload, list):
+                raise RuntimeError(f"github_issue_query_failed:{status}")
+            for item in payload:
+                if not isinstance(item, dict) or "pull_request" in item:
+                    continue
+                projected = _issue_row(owner, repo, item)
+                if projected["number"] > 0:
+                    rows.append(projected)
+                    if len(rows) >= int(limit):
+                        break
+            if len(payload) < page_size:
+                complete = True
+                break
+            page += 1
+    except RuntimeError as error:
+        return urirun.fail(str(error), owner=owner, repo=repo, mutation_attempted=False)
+    return urirun.ok(
+        owner=owner,
+        repo=repo,
+        state=state,
+        issues=rows[:int(limit)],
+        count=len(rows[:int(limit)]),
+        complete=complete,
+        requests=requests,
+        mutation_attempted=False,
+    )
+
+
 @conn.handler("account/query/twin", isolated=True, meta={"label": "Map visible GitHub account resources"})
 def account_query_twin(max_items: int = 1000, instance_id: str = "github.com") -> dict[str, Any]:
     try:
